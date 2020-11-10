@@ -9,7 +9,7 @@ use bitcoin::{
     consensus::encode::{deserialize, serialize, Decodable, Encodable, ReadExt, VarInt},
     hashes::{borrow_slice_impl, hash_newtype, hex_fmt_impl, index_impl, serde_impl, sha256, Hash},
     util::key::PublicKey,
-    BlockHeader, Script, Transaction, Txid,
+    BlockHeader, OutPoint, Script, Transaction, Txid,
 };
 
 use crate::{daemon::Daemon, db};
@@ -263,12 +263,6 @@ impl ScriptHash {
     }
 }
 
-fn txid_prefix(txid: &Txid) -> TxidPrefix {
-    let mut prefix = [0u8; TXID_PREFIX_LEN];
-    prefix.copy_from_slice(&txid[..TXID_PREFIX_LEN]);
-    TxidPrefix { prefix }
-}
-
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ScriptHashRow {
     prefix: ScriptHashPrefix,
@@ -304,6 +298,12 @@ impl ScriptHashRow {
     }
 }
 
+fn txid_prefix(txid: &Txid) -> TxidPrefix {
+    let mut prefix = [0u8; TXID_PREFIX_LEN];
+    prefix.copy_from_slice(&txid[..TXID_PREFIX_LEN]);
+    TxidPrefix { prefix }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TxidRow {
     prefix: TxidPrefix,
@@ -314,7 +314,7 @@ impl_consensus_encoding!(TxidRow, prefix, pos);
 
 impl TxidRow {
     pub fn scan_prefix(txid: &Txid) -> Box<[u8]> {
-        txid[..TXID_PREFIX_LEN].to_vec().into_boxed_slice()
+        Box::new(txid_prefix(&txid).prefix)
     }
 
     pub fn new(txid: Txid, pos: FilePos) -> Self {
@@ -357,6 +357,58 @@ impl BlockRow {
 
     pub fn from_db_row(row: &[u8]) -> Result<Self> {
         deserialize(&row).context("bad BlockRowKey")
+    }
+}
+
+const SPENT_PREFIX_LEN: usize = 8;
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct SpentPrefix {
+    prefix: [u8; SPENT_PREFIX_LEN],
+}
+
+impl_consensus_encoding!(SpentPrefix, prefix);
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct SpentRow {
+    prefix: SpentPrefix,
+    pos: FilePos, // spending transaction position on disk
+}
+
+impl_consensus_encoding!(SpentRow, prefix, pos);
+
+fn spent_prefix(outpoint: &OutPoint) -> SpentPrefix {
+    let mut prefix = [0u8; SPENT_PREFIX_LEN];
+    prefix.copy_from_slice(&outpoint.txid[..SPENT_PREFIX_LEN]);
+    let vout = outpoint.vout.to_be_bytes();
+    // XOR vout into the end of txid prefix.
+    // It should result in pseudorandom prefix, w.h.p. being unique per outpoint.
+    for (p, v) in prefix.iter_mut().rev().zip(vout.iter()) {
+        *p ^= *v;
+    }
+    SpentPrefix { prefix }
+}
+
+impl SpentRow {
+    pub fn scan_prefix(spent: &OutPoint) -> Box<[u8]> {
+        Box::new(spent_prefix(spent).prefix)
+    }
+
+    pub fn new(spent: &OutPoint, pos: FilePos) -> Self {
+        let prefix = spent_prefix(spent);
+        Self { prefix, pos }
+    }
+
+    pub fn to_db_row(&self) -> db::Row {
+        serialize(self).into_boxed_slice()
+    }
+
+    pub fn from_db_row(row: &[u8]) -> Result<Self> {
+        deserialize(&row).context("bad SpentRow")
+    }
+
+    pub fn position(&self) -> &FilePos {
+        &self.pos
     }
 }
 

@@ -23,7 +23,7 @@ use electrs_index::{
             hex::{FromHex, ToHex},
             hex_fmt_impl, index_impl, serde_impl, sha256, Hash,
         },
-        BlockHash, Transaction, TxMerkleNode, Txid,
+        BlockHash, OutPoint, Transaction, TxMerkleNode, Txid,
     },
     Confirmed, Daemon, Histogram, Index, Metrics, ScriptHash,
 };
@@ -412,6 +412,44 @@ impl Rpc {
             .is_some()))
     }
 
+    fn outpoint_subscribe(&self, (txid, vout): (Txid, u32)) -> Result<Value> {
+        // TODO: check mempool as well
+        let confirmed = match self.transaction_get_confirmed(&txid)? {
+            Some(confirmed) => confirmed,
+            None => return Ok(json!({})),
+        };
+
+        let funding = OutPoint { txid, vout };
+        let result = self
+            .index
+            .lookup_spent(&funding, &self.daemon)
+            .context("spent lookup failed")?;
+        let spending: Vec<Confirmed> = result
+            .readers
+            .into_par_iter()
+            .filter_map(|r| {
+                let result = r.read();
+                match result.as_ref() {
+                    Ok(confirmed) if is_spending(&confirmed.tx, funding) => Some(result),
+                    Ok(confirmed) => {
+                        warn!("{:?} does not spend {}", confirmed, funding);
+                        None
+                    }
+                    Err(_) => Some(result),
+                }
+            })
+            .collect::<Result<_>>()
+            .context("transaction reading failed")?;
+        Ok(match spending.len() {
+            0 => json!({"height": confirmed.height}),
+            1 => {
+                let spender = spending.into_iter().next().unwrap();
+                json!({"height": confirmed.height, "spender_txhash": spender.txid, "spender_height": spender.height})
+            }
+            _ => panic!("double spend of {} by {:?}", funding, spending),
+        })
+    }
+
     fn get_confirmed(&self, scripthash: &ScriptHash) -> Result<(Vec<TxEntry>, BlockHash)> {
         let result = self
             .index
@@ -590,6 +628,7 @@ impl Rpc {
                 "blockchain.transaction.get_merkle" => {
                     self.transaction_get_merkle(from_value(params)?)
                 }
+                "blockchain.outpoint.subscribe" => self.outpoint_subscribe(from_value(params)?),
                 "server.banner" => Ok(json!(BANNER)),
                 "server.donation_address" => Ok(Value::Null),
                 "server.peers.subscribe" => Ok(json!([])),
@@ -638,6 +677,10 @@ fn create_merkle_branch<T: Hash>(mut hashes: Vec<T>, mut index: usize) -> Vec<T>
             .collect()
     }
     result
+}
+
+fn is_spending(tx: &Transaction, funding: OutPoint) -> bool {
+    tx.input.iter().any(|txi| txi.previous_output == funding)
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use bitcoin::{
     consensus::{serialize, Decodable},
     hashes::hex::ToHex,
-    Block, BlockHash, BlockHeader, Txid, VarInt,
+    Block, BlockHash, BlockHeader, OutPoint, Txid, VarInt,
 };
 
 use std::{
@@ -22,7 +22,10 @@ use crate::{
     db,
     map::BlockMap,
     metrics::{Histogram, Metrics},
-    types::{BlockRow, BlockUndo, Confirmed, FilePos, Reader, ScriptHash, ScriptHashRow, TxidRow},
+    types::{
+        BlockRow, BlockUndo, Confirmed, FilePos, Reader, ScriptHash, ScriptHashRow, SpentRow,
+        TxidRow,
+    },
 };
 
 pub struct Index {
@@ -46,6 +49,12 @@ struct ReadRequest {
     undo_file: PathBuf,
 }
 
+struct ParseResult {
+    loc: BlockLocation,
+    block: Block,
+    undo: BlockUndo,
+}
+
 struct IndexRequest {
     file_id: usize,
     locations: Vec<BlockLocation>,
@@ -53,14 +62,25 @@ struct IndexRequest {
     undo_file: Cursor<Vec<u8>>,
 }
 
-impl db::WriteBatch {
-    fn index(&mut self, loc: BlockLocation, block: Block, undo: BlockUndo) {
-        let (index_rows, txid_rows, header_row) = index_single_block(loc, block, undo);
-        self.index_rows
-            .extend(index_rows.iter().map(ScriptHashRow::to_db_row));
-        self.txid_rows
-            .extend(txid_rows.iter().map(TxidRow::to_db_row));
-        self.header_rows.push(header_row.to_db_row());
+struct IndexResult {
+    header_row: BlockRow,
+    script_hash_rows: Vec<ScriptHashRow>,
+    spent_rows: Vec<SpentRow>,
+    txid_rows: Vec<TxidRow>,
+}
+
+impl IndexResult {
+    fn extend(&self, batch: &mut db::WriteBatch) {
+        batch
+            .index_rows
+            .extend(self.script_hash_rows.iter().map(ScriptHashRow::to_db_row));
+        batch
+            .spent_rows
+            .extend(self.spent_rows.iter().map(SpentRow::to_db_row));
+        batch
+            .txid_rows
+            .extend(self.txid_rows.iter().map(TxidRow::to_db_row));
+        batch.header_rows.push(self.header_row.to_db_row());
     }
 }
 
@@ -143,6 +163,23 @@ impl Index {
         self.create_readers(txid.to_hex(), positions, daemon)
     }
 
+    pub fn lookup_spent(&self, funding: &OutPoint, daemon: &Daemon) -> Result<LookupResult> {
+        let funding_prefix = SpentRow::scan_prefix(funding);
+        let positions: Vec<FilePos> =
+            self.stats
+                .lookup_duration
+                .observe_duration("lookup_scan_rows", || {
+                    self.store
+                        .read()
+                        .unwrap()
+                        .iter_spent(&funding_prefix)
+                        .map(|row| SpentRow::from_db_row(&row).map(|row| *row.position()))
+                        .collect::<Result<Vec<_>>>()
+                        .context("failed to parse spent rows")
+                })?;
+        self.create_readers(funding.to_string(), positions, daemon)
+    }
+
     pub fn lookup_by_scripthash(
         &self,
         script_hash: &ScriptHash,
@@ -171,7 +208,7 @@ impl Index {
         positions: Vec<FilePos>,
         daemon: &Daemon,
     ) -> Result<LookupResult> {
-        debug!("{} has {} txid rows", label, positions.len());
+        debug!("{} has {} rows", label, positions.len());
         let map = self.map(); // lock block map for concurrent updates
         let readers = positions
             .into_iter()
@@ -249,19 +286,18 @@ impl Index {
                         Err(_) => break, // channel has disconnected
                     }
                 };
-                let parsed: Vec<(BlockLocation, Block, BlockUndo)> = update_duration
-                    .observe_duration("parse", || {
-                        locations
-                            .into_iter()
-                            .map(|loc| parse_block_and_undo(loc, &mut blk_file, &mut undo_file))
-                            .collect()
-                    });
+                let parsed: Vec<ParseResult> = update_duration.observe_duration("parse", || {
+                    locations
+                        .into_iter()
+                        .map(|loc| parse_block_and_undo(loc, &mut blk_file, &mut undo_file))
+                        .collect()
+                });
                 let blocks_count = parsed.len();
 
                 let mut result = db::WriteBatch::default();
                 update_duration.observe_duration("index", || {
-                    parsed.into_iter().for_each(|(loc, block, undo)| {
-                        result.index(loc, block, undo);
+                    parsed.into_iter().for_each(|p| {
+                        index_single_block(p).extend(&mut result);
                     });
                 });
                 debug!(
@@ -294,11 +330,16 @@ impl Index {
             .observe_size("write_txid_rows", db_rows_size(&batch.txid_rows));
         self.stats
             .update_size
+            .observe_size("write_spent_rows", db_rows_size(&batch.spent_rows));
+        self.stats
+            .update_size
             .observe_size("write_header_rows", db_rows_size(&batch.header_rows));
         debug!(
-            "writing index {} rows from {} blocks",
+            "writing {} script hash rows, {} spent rows from {} transactions, {} blocks",
             batch.index_rows.len(),
-            batch.header_rows.len(),
+            batch.spent_rows.len(),
+            batch.txid_rows.len(),
+            batch.header_rows.len()
         );
     }
 
@@ -340,9 +381,8 @@ impl Index {
                 let mut undo_file = std::fs::File::open(r.undo_file)?;
                 let mut batch = db::WriteBatch::default();
                 for loc in r.locations {
-                    let (loc, block, undo) =
-                        parse_block_and_undo(loc, &mut blk_file, &mut undo_file);
-                    batch.index(loc, block, undo);
+                    let parsed = parse_block_and_undo(loc, &mut blk_file, &mut undo_file);
+                    index_single_block(parsed).extend(&mut batch);
                 }
                 let batch_block_rows = batch
                     .header_rows
@@ -369,16 +409,17 @@ impl Index {
         drop(indexer_tx); // no need for the original sender
 
         let mut block_rows = vec![];
-        let mut index_rows_count = 0usize;
+        let mut total_rows_count = 0usize;
         for batch in indexer_rx.into_iter() {
             let batch_block_rows = batch
                 .header_rows
                 .iter()
                 .map(|row| BlockRow::from_db_row(row).expect("bad BlockRow"));
             block_rows.extend(batch_block_rows);
-            index_rows_count += batch.index_rows.len();
+
             self.report_stats(&batch);
-            self.stats
+            total_rows_count += self
+                .stats
                 .update_duration
                 .observe_duration("write", || self.store.read().unwrap().write(batch));
         }
@@ -397,7 +438,7 @@ impl Index {
         info!(
             "indexed {} new blocks, {} DB rows, took {:.3}s",
             block_rows.len(),
-            index_rows_count,
+            total_rows_count,
             start.elapsed().as_millis() as f64 / 1e3
         );
         assert_eq!(new_blocks, block_rows.len());
@@ -412,13 +453,11 @@ fn db_rows_size(rows: &[db::Row]) -> usize {
     rows.iter().map(|key| key.len()).sum()
 }
 
-fn index_single_block(
-    loc: BlockLocation,
-    block: Block,
-    undo: BlockUndo,
-) -> (Vec<ScriptHashRow>, Vec<TxidRow>, BlockRow) {
+fn index_single_block(parsed: ParseResult) -> IndexResult {
+    let ParseResult { loc, block, undo } = parsed;
     assert!(undo.txdata.len() + 1 == block.txdata.len());
     let mut script_hash_rows = vec![];
+    let mut spent_rows = vec![];
     let mut txid_rows = Vec::with_capacity(block.txdata.len());
 
     let file_id = loc.file as u16;
@@ -444,20 +483,23 @@ fn index_single_block(
             };
             ScriptHashRow::new(ScriptHash::new(script), pos)
         };
-        tx.output
-            .iter()
-            .map(|txo| &txo.script_pubkey)
-            .for_each(|script| script_hash_rows.push(create_index_row(script)));
+        script_hash_rows.extend(
+            tx.output
+                .iter()
+                .map(|txo| create_index_row(&txo.script_pubkey)),
+        );
+        spent_rows.extend(
+            tx.input
+                .iter()
+                .map(|txi| SpentRow::new(&txi.previous_output, pos)),
+        );
 
         if tx.is_coin_base() {
             continue; // coinbase doesn't have an undo
         }
         let txundo = undo_iter.next().expect("no txundo");
         assert_eq!(tx.input.len(), txundo.scripts.len());
-        txundo
-            .scripts
-            .iter()
-            .for_each(|script| script_hash_rows.push(create_index_row(script)));
+        script_hash_rows.extend(txundo.scripts.iter().map(|script| create_index_row(script)));
     }
     assert!(undo_iter.next().is_none());
     let block_pos = FilePos {
@@ -465,11 +507,12 @@ fn index_single_block(
         offset: loc.data as u32,
     };
     let block_size = (next_tx_offset - loc.data) as u32;
-    (
+    IndexResult {
         script_hash_rows,
         txid_rows,
-        BlockRow::new(block.header, block_pos, block_size),
-    )
+        spent_rows,
+        header_row: BlockRow::new(block.header, block_pos, block_size),
+    }
 }
 
 fn load_locations(
@@ -543,11 +586,10 @@ fn parse_from<T: Decodable, F: Read + Seek>(src: &mut F, offset: usize) -> Resul
     Ok(Decodable::consensus_decode(src).context("parsing failed")?)
 }
 
-fn parse_block_and_undo<F: Read + Seek>(
-    loc: BlockLocation,
-    blk_file: &mut F,
-    undo_file: &mut F,
-) -> (BlockLocation, Block, BlockUndo) {
+fn parse_block_and_undo<F>(loc: BlockLocation, blk_file: &mut F, undo_file: &mut F) -> ParseResult
+where
+    F: Read + Seek,
+{
     blk_file
         .seek(SeekFrom::Start(loc.data as u64))
         .expect("failed to seek");
@@ -563,7 +605,7 @@ fn parse_block_and_undo<F: Read + Seek>(
             assert_eq!(block.header.prev_blockhash, BlockHash::default());
             BlockUndo::default() // create an empty undo
         });
-    (loc, block, undo)
+    ParseResult { loc, block, undo }
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {

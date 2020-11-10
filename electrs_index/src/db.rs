@@ -8,6 +8,7 @@ pub(crate) type Row = Box<[u8]>;
 pub(crate) struct WriteBatch {
     pub(crate) header_rows: Vec<Row>,
     pub(crate) index_rows: Vec<Row>,
+    pub(crate) spent_rows: Vec<Row>,
     pub(crate) txid_rows: Vec<Row>,
 }
 
@@ -28,6 +29,7 @@ const CONFIG_CF: &str = "config";
 const HEADERS_CF: &str = "headers";
 const TXID_CF: &str = "txid";
 const INDEX_CF: &str = "index";
+const SPENT_CF: &str = "spent";
 
 const CONFIG_KEY: &str = "C";
 
@@ -63,7 +65,7 @@ impl DBStore {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
 
-        let cfs = vec![CONFIG_CF, HEADERS_CF, TXID_CF, INDEX_CF];
+        let cfs = vec![CONFIG_CF, HEADERS_CF, TXID_CF, INDEX_CF, SPENT_CF];
         let cf_descriptors: Vec<rocksdb::ColumnFamilyDescriptor> = cfs
             .iter()
             .map(|&name| rocksdb::ColumnFamilyDescriptor::new(name, default_opts(opts.low_memory)))
@@ -96,6 +98,10 @@ impl DBStore {
 
     fn index_cf(&self) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(INDEX_CF).expect("missing INDEX_CF")
+    }
+
+    fn spent_cf(&self) -> &rocksdb::ColumnFamily {
+        self.db.cf_handle(SPENT_CF).expect("missing SPENT_CF")
     }
 
     fn txid_cf(&self) -> &rocksdb::ColumnFamily {
@@ -135,6 +141,16 @@ impl DBStore {
         }
     }
 
+    pub(crate) fn iter_spent<'a>(&'a self, prefix: &'a [u8]) -> ScanIterator<'a> {
+        let mode = rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward);
+        let iter = self.db.iterator_cf(self.spent_cf(), mode);
+        ScanIterator {
+            prefix,
+            iter,
+            done: false,
+        }
+    }
+
     pub(crate) fn read_headers(&self) -> Vec<Row> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.fill_cache(false);
@@ -144,21 +160,30 @@ impl DBStore {
             .collect()
     }
 
-    pub(crate) fn write(&self, batch: WriteBatch) {
+    pub(crate) fn write(&self, batch: WriteBatch) -> usize {
         let mut db_batch = rocksdb::WriteBatch::default();
+        let mut total_rows_count = 0;
         for key in batch.index_rows {
             db_batch.put_cf(self.index_cf(), key, b"");
+            total_rows_count += 1;
+        }
+        for key in batch.spent_rows {
+            db_batch.put_cf(self.spent_cf(), key, b"");
+            total_rows_count += 1;
         }
         for key in batch.txid_rows {
             db_batch.put_cf(self.txid_cf(), key, b"");
+            total_rows_count += 1;
         }
         for key in batch.header_rows {
             db_batch.put_cf(self.headers_cf(), key, b"");
+            total_rows_count += 1;
         }
         let mut opts = rocksdb::WriteOptions::new();
         opts.set_sync(!self.opts.bulk_import);
         opts.disable_wal(self.opts.bulk_import);
         self.db.write_opt(db_batch, &opts).unwrap();
+        total_rows_count
     }
 
     pub(crate) fn flush(&mut self) {
